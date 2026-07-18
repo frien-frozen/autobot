@@ -21,9 +21,10 @@ class Settings(BaseSettings):
 
     bot_token: str
     owner_user_id: int
+    # Extra accounts that are also you (comma-separated)
+    owner_ids: str = ""
     gemini_api_key: str
     gemini_model: str = "gemini-3.5-flash"
-    # polling = local testing; webhook = Render / production
     mode: str = "polling"
     webhook_url: str = ""
     webhook_secret: str = "change-me"
@@ -31,6 +32,9 @@ class Settings(BaseSettings):
     data_dir: Path = Path("./data")
     history_limit: int = 40
     owner_pause_minutes: int = 30
+    timezone: str = "Asia/Tashkent"
+    scheduler_poll_seconds: int = 20
+    reminder_followup_hours: int = 3
 
     @model_validator(mode="after")
     def resolve_webhook_url(self) -> Settings:
@@ -57,6 +61,18 @@ class Settings(BaseSettings):
     def sanitize_secret(cls, value: str) -> str:
         cleaned = "".join(ch for ch in value if ch.isalnum() or ch in "_-")
         return cleaned or "chatauto-secret"
+
+    @property
+    def all_owner_ids(self) -> set[int]:
+        ids = {self.owner_user_id}
+        for part in self.owner_ids.split(","):
+            part = part.strip()
+            if part:
+                ids.add(int(part))
+        return ids
+
+    def is_owner(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.all_owner_ids
 
     @property
     def db_path(self) -> Path:

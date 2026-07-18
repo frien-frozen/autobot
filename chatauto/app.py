@@ -17,6 +17,7 @@ from telegram.ext import (
 from chatauto.config import Settings, get_settings
 from chatauto.gemini import GeminiReplier
 from chatauto.handlers import on_business_connection, on_business_message, on_direct_message
+from chatauto.scheduler import scheduler_loop
 from chatauto.store import Store
 
 logging.basicConfig(
@@ -40,6 +41,7 @@ def build_application(settings: Settings, *, use_updater: bool) -> Application:
         api_key=settings.gemini_api_key,
         model=settings.gemini_model,
         persona=settings.load_persona(),
+        timezone=settings.timezone,
     )
 
     builder = Application.builder().token(settings.bot_token)
@@ -65,20 +67,8 @@ def build_application(settings: Settings, *, use_updater: bool) -> Application:
     return application
 
 
-async def _run_polling(settings: Settings) -> None:
-    application = build_application(settings, use_updater=True)
+async def _serve(settings: Settings, application: Application) -> None:
     store: Store = application.bot_data["store"]
-
-    await store.connect()
-    await application.initialize()
-    await application.bot.delete_webhook(drop_pending_updates=True)
-    await application.start()
-    assert application.updater is not None
-    await application.updater.start_polling(allowed_updates=ALLOWED_UPDATES)
-
-    me = await application.bot.get_me()
-    logger.info("Polling as @%s — connect Business chatbot, then test from another account", me.username)
-
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -87,22 +77,29 @@ async def _run_polling(settings: Settings) -> None:
         except NotImplementedError:
             pass
 
-    try:
-        await stop.wait()
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        await store.close()
+    scheduler_task = asyncio.create_task(scheduler_loop(application, stop))
 
+    if settings.mode == "polling":
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        assert application.updater is not None
+        await application.updater.start_polling(allowed_updates=ALLOWED_UPDATES)
+        me = await application.bot.get_me()
+        logger.info(
+            "Polling as @%s | owners=%s",
+            me.username,
+            sorted(settings.all_owner_ids),
+        )
+        try:
+            await stop.wait()
+        finally:
+            stop.set()
+            await scheduler_task
+            await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            await store.close()
+        return
 
-async def _run_webhook(settings: Settings) -> None:
-    application = build_application(settings, use_updater=False)
-    store: Store = application.bot_data["store"]
-
-    await store.connect()
-    await application.initialize()
-    await application.start()
     await application.bot.set_webhook(
         url=settings.webhook_full_url,
         allowed_updates=ALLOWED_UPDATES,
@@ -135,29 +132,29 @@ async def _run_webhook(settings: Settings) -> None:
     await site.start()
     logger.info("Listening on 0.0.0.0:%s", settings.port)
 
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
-            pass
-
     try:
         await stop.wait()
     finally:
+        stop.set()
+        await scheduler_task
         await application.stop()
         await application.shutdown()
         await store.close()
         await runner.cleanup()
 
 
-def main() -> None:
+async def _run() -> None:
     settings = get_settings()
-    if settings.mode == "polling":
-        asyncio.run(_run_polling(settings))
-    else:
-        asyncio.run(_run_webhook(settings))
+    application = build_application(settings, use_updater=(settings.mode == "polling"))
+    store: Store = application.bot_data["store"]
+    await store.connect()
+    await application.initialize()
+    await application.start()
+    await _serve(settings, application)
+
+
+def main() -> None:
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

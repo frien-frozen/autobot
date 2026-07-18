@@ -50,9 +50,47 @@ class Store:
                 chat_id INTEGER PRIMARY KEY,
                 pause_until REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fact TEXT NOT NULL,
+                is_secret INTEGER NOT NULL DEFAULT 0,
+                source TEXT,
+                created_at REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                run_at REAL NOT NULL,
+                repeat_rule TEXT,
+                target_chat_id INTEGER,
+                target_username TEXT,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at REAL NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_due
+                ON jobs(status, run_at);
             """
         )
         await self._db.commit()
+        await self._seed_default_memories()
+
+    async def _seed_default_memories(self) -> None:
+        cursor = await self.db.execute(
+            "SELECT 1 FROM memories WHERE fact LIKE ? LIMIT 1",
+            ("%baxtiyorov.uz%",),
+        )
+        if await cursor.fetchone():
+            return
+        await self.add_memory(
+            "Personal site / portfolio: https://baxtiyorov.uz",
+            is_secret=False,
+            source="seed",
+        )
 
     async def close(self) -> None:
         if self._db is not None:
@@ -93,6 +131,18 @@ class Store:
         )
         await self.db.commit()
 
+    async def get_active_connection(self) -> dict | None:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM business_connections
+            WHERE is_enabled = 1
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def can_reply(self, connection_id: str) -> bool:
         cursor = await self.db.execute(
             """
@@ -104,7 +154,6 @@ class Store:
         )
         row = await cursor.fetchone()
         if row is None:
-            # Connection update may arrive after first message; allow reply attempt.
             return True
         return bool(row["is_enabled"] and row["can_reply"])
 
@@ -146,6 +195,15 @@ class Store:
         cursor = await self.db.execute(
             "SELECT * FROM contacts WHERE chat_id = ?",
             (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_contact_by_username(self, username: str) -> dict | None:
+        clean = username.lstrip("@").lower()
+        cursor = await self.db.execute(
+            "SELECT * FROM contacts WHERE lower(username) = ?",
+            (clean,),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -201,3 +259,105 @@ class Store:
             await self.db.commit()
             return False
         return True
+
+    async def add_memory(self, fact: str, *, is_secret: bool, source: str | None = None) -> int:
+        cursor = await self.db.execute(
+            """
+            INSERT INTO memories (fact, is_secret, source, created_at, active)
+            VALUES (?, ?, ?, ?, 1)
+            """,
+            (fact.strip(), int(is_secret), source, time.time()),
+        )
+        await self.db.commit()
+        return int(cursor.lastrowid)
+
+    async def list_memories(self, *, include_secrets: bool) -> list[dict]:
+        if include_secrets:
+            cursor = await self.db.execute(
+                """
+                SELECT * FROM memories
+                WHERE active = 1
+                ORDER BY created_at DESC
+                LIMIT 80
+                """
+            )
+        else:
+            cursor = await self.db.execute(
+                """
+                SELECT * FROM memories
+                WHERE active = 1 AND is_secret = 0
+                ORDER BY created_at DESC
+                LIMIT 40
+                """
+            )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def add_job(
+        self,
+        *,
+        kind: str,
+        run_at: float,
+        text: str,
+        repeat_rule: str | None = None,
+        target_chat_id: int | None = None,
+        target_username: str | None = None,
+    ) -> int:
+        cursor = await self.db.execute(
+            """
+            INSERT INTO jobs
+                (kind, run_at, repeat_rule, target_chat_id, target_username, text, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                kind,
+                run_at,
+                repeat_rule,
+                target_chat_id,
+                target_username.lstrip("@") if target_username else None,
+                text,
+                time.time(),
+            ),
+        )
+        await self.db.commit()
+        return int(cursor.lastrowid)
+
+    async def due_jobs(self, now: float, limit: int = 20) -> list[dict]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'pending' AND run_at <= ?
+            ORDER BY run_at ASC
+            LIMIT ?
+            """,
+            (now, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def mark_job_done(self, job_id: int) -> None:
+        await self.db.execute(
+            "UPDATE jobs SET status = 'done' WHERE id = ?",
+            (job_id,),
+        )
+        await self.db.commit()
+
+    async def reschedule_job(self, job_id: int, run_at: float) -> None:
+        await self.db.execute(
+            "UPDATE jobs SET run_at = ?, status = 'pending' WHERE id = ?",
+            (run_at, job_id),
+        )
+        await self.db.commit()
+
+    async def pending_jobs(self, limit: int = 20) -> list[dict]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM jobs
+            WHERE status = 'pending'
+            ORDER BY run_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]

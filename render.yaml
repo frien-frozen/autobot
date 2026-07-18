@@ -15,10 +15,14 @@ services:
         sync: false
       - key: OWNER_USER_ID
         sync: false
+      - key: OWNER_IDS
+        sync: false
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
         value: gemini-3.5-flash
+      - key: TIMEZONE
+        value: Asia/Tashkent
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: DATA_DIR
@@ -27,3 +31,7 @@ services:
         value: "40"
       - key: OWNER_PAUSE_MINUTES
         value: "30"
+      - key: SCHEDULER_POLL_SECONDS
+        value: "20"
+      - key: REMINDER_FOLLOWUP_HOURS
+        value: "3"
