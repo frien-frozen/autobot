@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: chatauto
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m chatauto
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: MODE
+        value: webhook
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_USER_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.5-flash
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: DATA_DIR
+        value: /opt/render/project/src/data
+      - key: HISTORY_LIMIT
+        value: "40"
+      - key: OWNER_PAUSE_MINUTES
+        value: "30"
