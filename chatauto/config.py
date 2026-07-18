@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def resolve_webhook_url(self) -> Settings:
         self.mode = self.mode.strip().lower()
+
+        # Render web services MUST bind a port — force webhook there.
+        on_render = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
+        if on_render:
+            self.mode = "webhook"
+
         if self.mode not in {"polling", "webhook"}:
             raise ValueError("MODE must be 'polling' or 'webhook'")
 

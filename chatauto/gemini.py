@@ -11,30 +11,61 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
+# Owner must clearly ask — otherwise just chat like a human.
+ASSIST_INTENT = re.compile(
+    r"("
+    r"remind|reminder|eslat|eslatib|"
+    r"text\s+@|yubor|send\s+(to|him|her|them)|"
+    r"remember|eslab\s*qol|yodda\s*tut|"
+    r"don'?t tell|keep secret|sir\b|maxfiy|hech kimga|"
+    r"every\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"har\s+(dushanba|seshanba|chorshanba|payshanba|juma|shanba|yakshanba)|"
+    r"tomorrow|ertaga|daqiqadan|minutdan|soatdan|later\s+today|"
+    r"forget that|unut"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def has_assist_intent(text: str) -> bool:
+    return bool(ASSIST_INTENT.search(text or ""))
+
 
 def _extract_text(response) -> str:
-    """Pull plain text even when models return thought signatures / mixed parts."""
+    chunks: list[str] = []
+    for candidate in getattr(response, "candidates", None) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", None) or []:
+            # Skip thought / signature-only parts
+            if getattr(part, "thought", False):
+                continue
+            text = getattr(part, "text", None)
+            if text:
+                chunks.append(text)
+    if chunks:
+        return "\n".join(chunks).strip()
     try:
         if response.text:
             return response.text.strip()
     except Exception:
         pass
-
-    chunks: list[str] = []
-    for candidate in getattr(response, "candidates", None) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", None) or []:
-            text = getattr(part, "text", None)
-            if text:
-                chunks.append(text)
-    return "\n".join(chunks).strip()
+    return ""
 
 
-def _thinking_config() -> types.ThinkingConfig | None:
+def _gen_config(*, max_output_tokens: int, temperature: float) -> types.GenerateContentConfig:
+    kwargs: dict = {
+        "temperature": temperature,
+        "max_output_tokens": max_output_tokens,
+    }
     try:
-        return types.ThinkingConfig(thinking_budget=0)
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     except Exception:
-        return None
+        pass
+    try:
+        kwargs["automatic_function_calling"] = types.AutomaticFunctionCallingConfig(disable=True)
+    except Exception:
+        pass
+    return types.GenerateContentConfig(**kwargs)
 
 
 class GeminiReplier:
@@ -74,26 +105,20 @@ class GeminiReplier:
     def _memory_block(self, memories: list[dict], *, for_owner: bool) -> str:
         if not memories:
             return "Known facts about me: (none yet)"
-        label = "Known facts about me (owner-only context):" if for_owner else "Public facts I may use naturally:"
+        label = "Private notes about my life:" if for_owner else "Public facts I may use naturally:"
         lines = []
         for item in memories:
+            if not for_owner and item.get("is_secret"):
+                continue
             prefix = "[secret] " if item.get("is_secret") else ""
             lines.append(f"- {prefix}{item['fact']}")
-        return label + "\n" + "\n".join(lines)
+        return label + "\n" + ("\n".join(lines) if lines else "(none)")
 
     async def _generate(self, prompt: str, *, max_output_tokens: int = 2048, temperature: float = 0.8) -> str:
-        config_kwargs: dict = {
-            "temperature": temperature,
-            "max_output_tokens": max_output_tokens,
-        }
-        thinking = _thinking_config()
-        if thinking is not None:
-            config_kwargs["thinking_config"] = thinking
-
         response = await self.client.aio.models.generate_content(
             model=self.model,
             contents=prompt,
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=_gen_config(max_output_tokens=max_output_tokens, temperature=temperature),
         )
         return _extract_text(response)
 
@@ -109,17 +134,40 @@ class GeminiReplier:
             [
                 self.persona,
                 self._memory_block(public_memories, for_owner=False),
-                "Never mention private/secret facts. Never say you are a bot.",
+                "CRITICAL: You are Ismatulloh the human. Never reveal AI/bot/assistant. Never offer menus or features.",
                 self._contact_block(contact),
                 self._history_block(history),
                 f"New message from them:\n{incoming}",
-                "Write only the next Telegram reply as me. Complete sentences. No quotes, no labels.",
+                "Write only the next Telegram reply as me. Complete the thought. No quotes, no labels, no bullets.",
             ]
         )
         text = await self._generate(prompt, max_output_tokens=2048, temperature=0.85)
         if not text:
-            return "Сейчас не могу нормально ответить, чуть позже напишу."
+            return "Hozir joyida emasman, keyinroq yozaman."
         return text[:4000]
+
+    async def reply_casual_self(
+        self,
+        *,
+        incoming: str,
+        history: list[dict],
+        memories: list[dict],
+    ) -> str:
+        """Chill chat with yourself — no feature pitching, no actions."""
+        prompt = "\n\n".join(
+            [
+                self.persona,
+                self._memory_block(memories, for_owner=True),
+                "You are texting yourself / your other account. Be casual Ismatulloh.",
+                "Do NOT offer reminders, sending messages, or features unless they clearly asked.",
+                "Never say you are AI/bot/assistant.",
+                self._history_block(history),
+                f"Message:\n{incoming}",
+                "Reply like a normal short Telegram text. Complete sentences.",
+            ]
+        )
+        text = await self._generate(prompt, max_output_tokens=1024, temperature=0.9)
+        return (text or "ha")[:4000]
 
     async def assist_owner(
         self,
@@ -136,27 +184,25 @@ class GeminiReplier:
         ) or "(none)"
 
         schema = """
-Return ONLY valid JSON (no markdown) with this shape:
+Return ONLY valid JSON (no markdown):
 {
-  "reply": "short Telegram reply to me",
-  "actions": [
-    {"type": "remember", "fact": "...", "secret": false},
-    {"type": "remind", "when": "ISO-8601 datetime with timezone", "text": "reminder text", "ask_after_hours": 3},
-    {"type": "send", "to": "@username or numeric chat id", "when": "now" or ISO-8601, "text": "message to send as me", "repeat": null or "daily" or "weekly:mon|tue|wed|thu|fri|sat|sun"},
-    {"type": "forget", "contains": "substring of fact to deactivate"}
-  ]
+  "reply": "short Telegram reply as Ismatulloh",
+  "actions": []
 }
-Rules:
-- You are my private chief-of-staff living in Telegram.
-- I am the owner. Help with reminders, outbound texts, and memory.
-- If I share project/life facts, add remember actions.
-- If I say don't tell anyone / keep secret / between us → remember with secret=true.
-- If I ask to remind myself → remind action + reply confirming when.
-- If I ask to text someone now/later/recurring → send action.
-- when must use timezone Asia/Tashkent unless I specify otherwise.
-- ask_after_hours: after a reminder, ping me again asking if I actually did it (default 3).
-- reply must be complete, short, natural.
-- actions may be empty.
+
+Allowed actions (ONLY if the owner clearly asked — otherwise actions MUST be []):
+{"type":"remember","fact":"...","secret":false}
+{"type":"remind","when":"ISO-8601 with timezone","text":"...","ask_after_hours":3}
+{"type":"send","to":"@user or id","when":"now"|ISO-8601,"text":"...","repeat":null|"daily"|"weekly:mon"}
+{"type":"forget","contains":"..."}
+
+Rules for reply:
+- Sound exactly like Ismatulloh texting. Short. Match their language (Uzbek/Russian/English).
+- NEVER say you are AI, bot, assistant, secretary, yordamchi.
+- NEVER pitch features ("should I remind you?", "need me to send something?").
+- Only confirm a reminder/send if they asked for one.
+- Do not invent actions.
+- when uses Asia/Tashkent unless specified.
 """.strip()
 
         prompt = "\n\n".join(
@@ -169,7 +215,7 @@ Rules:
                 f"Owner message:\n{incoming}",
             ]
         )
-        raw = await self._generate(prompt, max_output_tokens=4096, temperature=0.4)
+        raw = await self._generate(prompt, max_output_tokens=4096, temperature=0.35)
         return _parse_assistant_json(raw)
 
 
@@ -195,4 +241,4 @@ def _parse_assistant_json(raw: str) -> dict:
                     return data
             except json.JSONDecodeError:
                 logger.warning("Failed to parse assistant JSON")
-    return {"reply": text[:3500] or "Got it.", "actions": []}
+    return {"reply": text[:3500] or "ha", "actions": []}

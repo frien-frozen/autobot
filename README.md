@@ -43,20 +43,24 @@ Message **@bakhy_autobot** directly, or message yourself from another of your ac
 
 `/start` prints examples.
 
-## Deploy / Render warning
+## Deploy / keep Free Render awake (no paid plan)
 
-**Free Render sleeps** after idle time. While asleep:
+Free Render sleeps after ~15 min idle. While asleep, reminders won’t fire.
 
-- webhooks delay / miss
-- reminders and scheduled texts **do not fire**
+**Hack:** ping your health URL every 5–10 minutes from a free uptime/cron service.
 
-For a real assistant, use one of:
+1. Deploy on **Free**
+2. Copy your URL, e.g. `https://instabot-xxxx.onrender.com/health`
+3. Create a job at [cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com):
+   - Method: `GET`
+   - URL: `https://YOUR-SERVICE.onrender.com/health`
+   - Interval: every **5 minutes**
+4. Confirm logs show regular requests and the process stays up
 
-- Render **Starter** (always on) + a persistent Disk for SQLite
-- Railway / Fly.io / any small VPS
+Limits: Free still has monthly hours (~750). If Render changes sleep rules, pings may stop working — then use Starter / a VPS.
 
-Env vars to set on host: `BOT_TOKEN`, `OWNER_USER_ID`, `OWNER_IDS`, `GEMINI_API_KEY`  
-(`MODE=webhook` is already in `render.yaml`)
+Env vars: `BOT_TOKEN`, `OWNER_USER_ID`, `OWNER_IDS`, `GEMINI_API_KEY`  
+(`MODE=webhook` — set manually or via `render.yaml`)
 
 ## Notes
 

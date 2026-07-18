@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 
 from chatauto.assistant import apply_actions
 from chatauto.config import Settings
-from chatauto.gemini import GeminiReplier
+from chatauto.gemini import GeminiReplier, has_assist_intent
 from chatauto.store import Store
 
 logger = logging.getLogger(__name__)
@@ -93,11 +93,12 @@ async def _split_send(
         await context.bot.send_message(**kwargs)
 
 
-async def _handle_owner_assistant(
+async def _handle_owner_chat(
     *,
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
     reply_via_business: bool,
+    force_assist: bool = False,
 ) -> None:
     settings: Settings = context.application.bot_data["settings"]
     store: Store = context.application.bot_data["store"]
@@ -110,7 +111,6 @@ async def _handle_owner_assistant(
     await store.add_message(chat_id, "them", text)
     history = await store.recent_messages(chat_id, settings.history_limit)
     memories = await store.list_memories(include_secrets=True)
-    pending = await store.pending_jobs(15)
 
     try:
         if reply_via_business and connection_id:
@@ -119,23 +119,39 @@ async def _handle_owner_assistant(
                 action="typing",
                 business_connection_id=connection_id,
             )
-        result = await gemini.assist_owner(
-            incoming=text,
-            history=history,
-            memories=memories,
-            pending_jobs=pending,
-        )
-        notes = await apply_actions(
-            actions=result.get("actions") or [],
-            store=store,
-            settings=settings,
-            context=context,
-            connection_id=connection_id
-            or ((await store.get_active_connection()) or {}).get("connection_id"),
-        )
-        reply = (result.get("reply") or "Got it.").strip()
-        if notes:
-            reply = reply + "\n\n" + "\n".join(f"• {n}" for n in notes)
+
+        # Casual chat with yourself = just be human. Actions only when clearly asked.
+        if not force_assist and not has_assist_intent(text):
+            reply = await gemini.reply_casual_self(
+                incoming=text,
+                history=history,
+                memories=memories,
+            )
+        else:
+            pending = await store.pending_jobs(15)
+            result = await gemini.assist_owner(
+                incoming=text,
+                history=history,
+                memories=memories,
+                pending_jobs=pending,
+            )
+            notes = await apply_actions(
+                actions=result.get("actions") or [],
+                store=store,
+                settings=settings,
+                context=context,
+                connection_id=connection_id
+                or ((await store.get_active_connection()) or {}).get("connection_id"),
+            )
+            reply = (result.get("reply") or "ha").strip()
+            # Only surface schedule confirms — never dump memory notes into the chat
+            useful = [
+                n
+                for n in notes
+                if n.startswith(("reminder", "send", "sent "))
+            ]
+            if useful:
+                reply = reply + "\n\n" + "\n".join(f"• {n}" for n in useful)
 
         await _split_send(
             context=context,
@@ -145,16 +161,16 @@ async def _handle_owner_assistant(
         )
         await store.add_message(chat_id, "me", reply)
     except Exception:
-        logger.exception("Owner assistant failed in chat %s", chat_id)
+        logger.exception("Owner chat failed in chat %s", chat_id)
         try:
             await _split_send(
                 context=context,
                 chat_id=chat_id,
-                text="Something glitched on my side — say that again?",
+                text="Hozir glitch bo'ldi, yana yozchi.",
                 business_connection_id=connection_id if reply_via_business else None,
             )
         except Exception:
-            logger.exception("Failed to send assistant error reply")
+            logger.exception("Failed to send owner error reply")
 
 
 async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -181,9 +197,9 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("Owner manual message in chat %s — paused %sm", chat_id, settings.owner_pause_minutes)
         return
 
-    # Talking to yourself across your accounts → personal assistant mode.
+    # Talking to yourself across your accounts.
     if settings.is_owner(sender_id) and settings.is_owner(chat_id):
-        await _handle_owner_assistant(
+        await _handle_owner_chat(
             message=message,
             context=context,
             reply_via_business=True,
@@ -239,18 +255,13 @@ async def on_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if message.text.startswith("/start"):
         await message.reply_text(
-            "Owner mode ready.\n"
-            "Message me here, or message yourself from your other account.\n\n"
-            "Examples:\n"
-            "• remind me tomorrow 10am to ask dad for money\n"
-            "• text @username tomorrow: hey, free for a call?\n"
-            "• every monday 9am text @username: weekly check-in\n"
-            "• remember: shipping baxtiyorov.uz redesign\n"
-            "• don't tell anyone: ...\n"
+            "ishlayapti.\n\n"
+            "oddiy yozish — oddiy javob.\n"
+            "eslatma / text @user / remember / don't tell — shunda action qiladi.\n"
         )
         return
 
-    await _handle_owner_assistant(
+    await _handle_owner_chat(
         message=message,
         context=context,
         reply_via_business=False,
