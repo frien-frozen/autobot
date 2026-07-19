@@ -208,6 +208,54 @@ class Store:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+    async def find_contact_fuzzy(self, username: str) -> dict | None:
+        """Exact first, then contains / suffix match (fixes truncated usernames)."""
+        clean = username.lstrip("@").lower()
+        exact = await self.get_contact_by_username(clean)
+        if exact:
+            return exact
+        if len(clean) < 3:
+            return None
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM contacts
+            WHERE username IS NOT NULL
+              AND (
+                lower(username) LIKE ?
+                OR lower(username) LIKE ?
+                OR ? LIKE '%' || lower(username)
+              )
+            ORDER BY length(username) ASC
+            LIMIT 5
+            """,
+            (f"%{clean}%", f"%{clean}", clean),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+        # Prefer username that ends with clean or equals closest length
+        scored = sorted(
+            rows,
+            key=lambda r: (
+                0 if (r["username"] or "").lower().endswith(clean) else 1,
+                abs(len((r["username"] or "")) - len(clean)),
+            ),
+        )
+        return dict(scored[0])
+
+    async def list_known_usernames(self, limit: int = 15) -> list[str]:
+        cursor = await self.db.execute(
+            """
+            SELECT username FROM contacts
+            WHERE username IS NOT NULL AND username != ''
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [f"@{r['username']}" for r in rows if r["username"]]
+
     async def add_message(self, chat_id: int, role: str, text: str) -> None:
         await self.db.execute(
             """

@@ -53,21 +53,105 @@ def parse_when(value: str, tz: ZoneInfo) -> datetime | None:
         return None
 
 
+MENTION_RE = re.compile(r"@([A-Za-z0-9_]{4,})", re.UNICODE)
+
+
+def extract_mentions_from_text(text: str) -> list[str]:
+    return [m.group(1) for m in MENTION_RE.finditer(text or "")]
+
+
+def extract_targets_from_message(message) -> list[tuple[int | None, str | None]]:
+    """
+    Returns list of (chat_id|None, username|None) from Telegram entities + regex.
+    text_mention gives real user id — best path for sending.
+    """
+    text = message.text or ""
+    found: list[tuple[int | None, str | None]] = []
+    seen: set[str] = set()
+
+    for ent in message.entities or []:
+        etype = str(getattr(ent, "type", "")).lower()
+        if "text_mention" in etype:
+            user = getattr(ent, "user", None)
+            if user is not None:
+                uname = getattr(user, "username", None)
+                key = f"id:{user.id}"
+                if key not in seen:
+                    seen.add(key)
+                    found.append((int(user.id), uname))
+        elif etype.endswith("mention") and "text_mention" not in etype:
+            try:
+                raw = text[ent.offset : ent.offset + ent.length]
+            except Exception:
+                continue
+            uname = raw.lstrip("@")
+            key = f"u:{uname.lower()}"
+            if uname and key not in seen:
+                seen.add(key)
+                found.append((None, uname))
+
+    for uname in extract_mentions_from_text(text):
+        key = f"u:{uname.lower()}"
+        if key not in seen:
+            seen.add(key)
+            found.append((None, uname))
+
+    return found
+
+
+def patch_send_actions_with_mentions(actions: list[dict], message) -> list[dict]:
+    """Force full @username / user id from the original message — don't trust Gemini truncation."""
+    targets = extract_targets_from_message(message)
+    if not targets:
+        return actions
+    # Prefer first mention in the owner message
+    chat_id, username = targets[0]
+    patched = []
+    for action in actions or []:
+        if not isinstance(action, dict):
+            patched.append(action)
+            continue
+        if str(action.get("type", "")).lower() != "send":
+            patched.append(action)
+            continue
+        new_action = dict(action)
+        if chat_id is not None:
+            new_action["to"] = str(chat_id)
+            if username:
+                new_action["_username"] = username
+        elif username:
+            new_action["to"] = f"@{username}"
+        patched.append(new_action)
+    return patched
+
+
 async def resolve_target(
     *,
     to_raw: str,
     store: Store,
     context: ContextTypes.DEFAULT_TYPE,
+    hint_username: str | None = None,
 ) -> tuple[int | None, str | None, str | None]:
     """Returns (chat_id, username, error)."""
-    to_raw = to_raw.strip()
+    to_raw = (to_raw or "").strip()
     if re.fullmatch(r"-?\d+", to_raw):
-        return int(to_raw), None, None
+        chat_id = int(to_raw)
+        # Ensure we remember optional username hint
+        if hint_username:
+            await store.upsert_contact(
+                chat_id=chat_id,
+                user_id=chat_id,
+                username=hint_username.lstrip("@"),
+                first_name=None,
+                last_name=None,
+                bio=None,
+            )
+        return chat_id, (hint_username.lstrip("@") if hint_username else None), None
 
     username = to_raw.lstrip("@")
-    known = await store.get_contact_by_username(username)
+    known = await store.find_contact_fuzzy(username)
     if known:
-        return int(known["chat_id"]), username, None
+        return int(known["chat_id"]), known.get("username") or username, None
 
     try:
         chat = await context.bot.get_chat(f"@{username}")
@@ -82,7 +166,19 @@ async def resolve_target(
         return int(chat.id), username, None
     except Exception as exc:
         logger.warning("Cannot resolve @%s: %s", username, exc)
-        return None, username, f"@{username} ni topa olmadim (avval u senga yozgan bo'lishi kerak)"
+        known_list = await store.list_known_usernames(12)
+        hint = (
+            f" Bilamanlar: {', '.join(known_list)}."
+            if known_list
+            else " Hali hech kim saqlanmagan."
+        )
+        return (
+            None,
+            username,
+            f"@{username} topilmadi.{hint} "
+            f"U odam BOT ga emas — SENING asosiy akkauntingga yozishi kerak. "
+            f"Yozgach qayta urinib ko'r.",
+        )
 
 
 async def apply_actions(
@@ -184,6 +280,7 @@ async def apply_actions(
                     to_raw=to_raw,
                     store=store,
                     context=context,
+                    hint_username=str(action.get("_username") or "") or None,
                 )
                 if err and target_chat_id is None:
                     notes.append(f"FAIL: {err}")

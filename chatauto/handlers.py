@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from telegram import Chat, Message, Update
 from telegram.ext import ContextTypes
 
-from chatauto.assistant import apply_actions, maybe_clear_nags_on_done
+from chatauto.assistant import (
+    apply_actions,
+    extract_targets_from_message,
+    maybe_clear_nags_on_done,
+    patch_send_actions_with_mentions,
+)
 from chatauto.config import Settings
 from chatauto.gemini import GeminiReplier, has_assist_intent
 from chatauto.store import Store
@@ -142,8 +148,40 @@ async def _handle_owner_chat(
                 memories=memories,
                 pending_jobs=pending,
             )
+            actions = patch_send_actions_with_mentions(result.get("actions") or [], message)
+            mentions = extract_targets_from_message(message)
+            has_send = any(
+                isinstance(a, dict) and str(a.get("type", "")).lower() == "send" for a in actions
+            )
+            if (
+                not has_send
+                and mentions
+                and re.search(r"(?i)\b(yoz|yubor|send|text|yozvor)\b", text)
+            ):
+                chat_id_t, uname_t = mentions[0]
+                body = text
+                for _, uname in mentions:
+                    if uname:
+                        body = re.sub(rf"@{re.escape(uname)}", "", body, flags=re.I)
+                body = re.sub(
+                    r"(?i)\b(shunga|unga|db\s*yozvor|yozvor|yozib\s*qo'?y|text|send)\b",
+                    " ",
+                    body,
+                )
+                body = re.sub(r"\s+", " ", body).strip(" -:\n\t\"'")
+                if body:
+                    actions.append(
+                        {
+                            "type": "send",
+                            "to": str(chat_id_t) if chat_id_t is not None else f"@{uname_t}",
+                            "when": "now",
+                            "text": body,
+                            "_username": uname_t,
+                        }
+                    )
+
             notes = await apply_actions(
-                actions=result.get("actions") or [],
+                actions=actions,
                 store=store,
                 settings=settings,
                 context=context,
