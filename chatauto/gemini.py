@@ -11,17 +11,18 @@ from google.genai import types
 
 logger = logging.getLogger(__name__)
 
-# Owner must clearly ask — otherwise just chat like a human.
 ASSIST_INTENT = re.compile(
     r"("
     r"remind|reminder|eslat|eslatib|"
-    r"text\s+@|yubor|send\s+(to|him|her|them)|"
+    r"text\s+@|@\w+\s+shunga|yozvor|yozib\s*qo'?y|yubor|send\s+(to|him|her|them)|"
     r"remember|eslab\s*qol|yodda\s*tut|"
     r"don'?t tell|keep secret|sir\b|maxfiy|hech kimga|"
     r"every\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
     r"har\s+(dushanba|seshanba|chorshanba|payshanba|juma|shanba|yakshanba)|"
     r"tomorrow|ertaga|daqiqadan|minutdan|soatdan|later\s+today|"
-    r"forget that|unut"
+    r"forget that|unut|"
+    r"kim\s+yozdi|kimdir|chqirdi|chaqirdi|call\s+me|ovqat|eat|"
+    r"yozaman|qilaman|eslatib\s*tur"
     r")",
     re.IGNORECASE,
 )
@@ -31,12 +32,21 @@ def has_assist_intent(text: str) -> bool:
     return bool(ASSIST_INTENT.search(text or ""))
 
 
+def _looks_sensitive_fact(fact: str) -> bool:
+    f = fact.lower()
+    keys = (
+        "mom", "dad", "ona", "ota", "oyim", "otam", "wife", "girlfriend", "aunt", "xola",
+        "relationship", "money", "pul", "family", "secret", "ovqat", "eat at", "invite",
+        "chaqirdi", "scam", "inbox:",
+    )
+    return any(k in f for k in keys)
+
+
 def _extract_text(response) -> str:
     chunks: list[str] = []
     for candidate in getattr(response, "candidates", None) or []:
         content = getattr(candidate, "content", None)
         for part in getattr(content, "parts", None) or []:
-            # Skip thought / signature-only parts
             if getattr(part, "thought", False):
                 continue
             text = getattr(part, "text", None)
@@ -78,7 +88,6 @@ class GeminiReplier:
     def _contact_block(self, contact: dict | None) -> str:
         if not contact:
             return "Contact profile: unknown"
-
         parts = []
         name = " ".join(
             p for p in [contact.get("first_name"), contact.get("last_name")] if p
@@ -105,11 +114,17 @@ class GeminiReplier:
     def _memory_block(self, memories: list[dict], *, for_owner: bool) -> str:
         if not memories:
             return "Known facts about me: (none yet)"
-        label = "Private notes about my life:" if for_owner else "Public facts I may use naturally:"
+        label = "Private notes (OWNER ONLY):" if for_owner else "Safe public facts only:"
         lines = []
         for item in memories:
-            if not for_owner and item.get("is_secret"):
-                continue
+            if not for_owner:
+                if item.get("is_secret"):
+                    continue
+                src = str(item.get("source") or "")
+                if src.startswith("inbox:"):
+                    continue
+                if _looks_sensitive_fact(item.get("fact") or ""):
+                    continue
             prefix = "[secret] " if item.get("is_secret") else ""
             lines.append(f"- {prefix}{item['fact']}")
         return label + "\n" + ("\n".join(lines) if lines else "(none)")
@@ -134,17 +149,51 @@ class GeminiReplier:
             [
                 self.persona,
                 self._memory_block(public_memories, for_owner=False),
-                "CRITICAL: You are Ismatulloh the human. Never reveal AI/bot/assistant. Never offer menus or features.",
+                "CRITICAL: You are Ismatulloh the human. Never reveal AI/bot/assistant.",
+                "NEVER mention family, relationships, money drama, private plans, or other people's invites "
+                "unless THIS contact already brought it up in THIS chat.",
                 self._contact_block(contact),
                 self._history_block(history),
                 f"New message from them:\n{incoming}",
-                "Write only the next Telegram reply as me. Complete the thought. No quotes, no labels, no bullets.",
+                "Write only the next Telegram reply as me. Complete the thought. No quotes/labels/bullets.",
             ]
         )
         text = await self._generate(prompt, max_output_tokens=2048, temperature=0.85)
         if not text:
             return "Hozir joyida emasman, keyinroq yozaman."
         return text[:4000]
+
+    async def extract_inbox_event(
+        self,
+        *,
+        contact: dict | None,
+        incoming: str,
+        reply: str,
+    ) -> str | None:
+        who = "someone"
+        if contact:
+            bits = [contact.get("first_name"), contact.get("last_name")]
+            name = " ".join(b for b in bits if b).strip()
+            if contact.get("username"):
+                who = f"{name} (@{contact['username']})" if name else f"@{contact['username']}"
+            elif name:
+                who = name
+        prompt = f"""
+Summarize this Telegram inbound into ONE short factual note for the account owner.
+Include who, what they want, time/place if any.
+If pure small talk with nothing useful, return exactly: NONE
+
+From: {who}
+Them: {incoming}
+My reply: {reply}
+
+Return only the note or NONE.
+""".strip()
+        text = await self._generate(prompt, max_output_tokens=200, temperature=0.1)
+        text = (text or "").strip()
+        if not text or text.upper().startswith("NONE"):
+            return None
+        return text[:300]
 
     async def reply_casual_self(
         self,
@@ -153,17 +202,16 @@ class GeminiReplier:
         history: list[dict],
         memories: list[dict],
     ) -> str:
-        """Chill chat with yourself — no feature pitching, no actions."""
         prompt = "\n\n".join(
             [
                 self.persona,
                 self._memory_block(memories, for_owner=True),
-                "You are texting yourself / your other account. Be casual Ismatulloh.",
-                "Do NOT offer reminders, sending messages, or features unless they clearly asked.",
-                "Never say you are AI/bot/assistant.",
+                "You are texting yourself. Be casual Ismatulloh.",
+                "Use inbox notes if relevant (e.g. someone invited you to eat).",
+                "No reminder menus. Never say AI/bot/assistant.",
                 self._history_block(history),
                 f"Message:\n{incoming}",
-                "Reply like a normal short Telegram text. Complete sentences.",
+                "Reply like a normal short Telegram text.",
             ]
         )
         text = await self._generate(prompt, max_output_tokens=1024, temperature=0.9)
@@ -179,7 +227,9 @@ class GeminiReplier:
     ) -> dict:
         now = datetime.now(self.tz).isoformat(timespec="minutes")
         jobs_preview = "\n".join(
-            f"- #{j['id']} {j['kind']} at {datetime.fromtimestamp(j['run_at'], self.tz).isoformat(timespec='minutes')}: {j['text'][:120]}"
+            f"- #{j['id']} {j['kind']} at "
+            f"{datetime.fromtimestamp(j['run_at'], self.tz).isoformat(timespec='minutes')}: "
+            f"{j['text'][:120]}"
             for j in pending_jobs
         ) or "(none)"
 
@@ -190,33 +240,58 @@ Return ONLY valid JSON (no markdown):
   "actions": []
 }
 
-Allowed actions (ONLY if the owner clearly asked — otherwise actions MUST be []):
-{"type":"remember","fact":"...","secret":false}
-{"type":"remind","when":"ISO-8601 with timezone","text":"...","ask_after_hours":3}
-{"type":"send","to":"@user or id","when":"now"|ISO-8601,"text":"...","repeat":null|"daily"|"weekly:mon"}
+Allowed actions (ONLY if clearly requested):
+{"type":"remember","fact":"...","secret":true}
+{"type":"remind","when":"ISO-8601 Asia/Tashkent","text":"...","ask_after_minutes":30}
+{"type":"send","to":"@user","when":"now"|ISO-8601,"text":"...","repeat":null|"daily"|"weekly:mon"}
 {"type":"forget","contains":"..."}
+{"type":"cancel_nags"}
 
-Rules for reply:
-- Sound exactly like Ismatulloh texting. Short. Match their language (Uzbek/Russian/English).
-- NEVER say you are AI, bot, assistant, secretary, yordamchi.
-- NEVER pitch features ("should I remind you?", "need me to send something?").
-- Only confirm a reminder/send if they asked for one.
-- Do not invent actions.
-- when uses Asia/Tashkent unless specified.
+Rules:
+- Sound like Ismatulloh. Short. Match Uzbek/Russian/English.
+- Do NOT claim sent/done in reply yet — system will append truth notes.
+- If they ask whether someone called/wrote/invited, use inbox notes and answer truthfully.
+- Family/relationships/money → remember secret:true.
+- Commitments like "I'll text mom" → remind + ask_after_minutes nag.
+- Never say AI/bot/assistant.
 """.strip()
 
-        prompt = "\n\n".join(
-            [
-                schema,
-                f"Current local time: {now}",
-                self._memory_block(memories, for_owner=True),
-                "Pending jobs:\n" + jobs_preview,
-                self._history_block(history),
-                f"Owner message:\n{incoming}",
-            ]
+        raw = await self._generate(
+            "\n\n".join(
+                [
+                    schema,
+                    f"Current local time: {now}",
+                    self._memory_block(memories, for_owner=True),
+                    "Pending jobs:\n" + jobs_preview,
+                    self._history_block(history),
+                    f"Owner message:\n{incoming}",
+                ]
+            ),
+            max_output_tokens=4096,
+            temperature=0.35,
         )
-        raw = await self._generate(prompt, max_output_tokens=4096, temperature=0.35)
         return _parse_assistant_json(raw)
+
+    async def rewrite_with_action_truth(self, *, draft_reply: str, notes: list[str]) -> str:
+        """Make the spoken reply match SENT/FAIL/QUEUED reality."""
+        if not notes:
+            return draft_reply
+        prompt = f"""
+Rewrite the Telegram reply so it matches ACTION RESULTS exactly.
+If FAIL — admit it didn't send / couldn't do it. Don't invent screenshots.
+If SENT — confirm briefly.
+If QUEUED — say it's scheduled, not sent yet.
+Keep short, casual Uzbek/Russian/English like Ismatulloh. No AI talk.
+
+Draft: {draft_reply}
+
+ACTION RESULTS:
+{chr(10).join('- ' + n for n in notes)}
+
+Return only the final reply text.
+""".strip()
+        text = await self._generate(prompt, max_output_tokens=400, temperature=0.2)
+        return (text or draft_reply)[:4000]
 
 
 def _parse_assistant_json(raw: str) -> dict:

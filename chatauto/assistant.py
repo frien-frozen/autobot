@@ -29,6 +29,14 @@ WEEKDAYS = {
     "sunday": 6,
 }
 
+DONE_RE = re.compile(
+    r"\b("
+    r"ha|xa|yes|yep|done|did|qildim|yozdim|yubordim|jonatdim|jo'?natdim|"
+    r"gaplashdim|telefon\s*qildim|chqardim|bo'?ldi|ok\b|okay"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def parse_when(value: str, tz: ZoneInfo) -> datetime | None:
     value = (value or "").strip()
@@ -45,11 +53,36 @@ def parse_when(value: str, tz: ZoneInfo) -> datetime | None:
         return None
 
 
-def next_weekly(from_dt: datetime, weekday: int) -> datetime:
-    days_ahead = (weekday - from_dt.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    return from_dt + timedelta(days=days_ahead)
+async def resolve_target(
+    *,
+    to_raw: str,
+    store: Store,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[int | None, str | None, str | None]:
+    """Returns (chat_id, username, error)."""
+    to_raw = to_raw.strip()
+    if re.fullmatch(r"-?\d+", to_raw):
+        return int(to_raw), None, None
+
+    username = to_raw.lstrip("@")
+    known = await store.get_contact_by_username(username)
+    if known:
+        return int(known["chat_id"]), username, None
+
+    try:
+        chat = await context.bot.get_chat(f"@{username}")
+        await store.upsert_contact(
+            chat_id=chat.id,
+            user_id=chat.id,
+            username=username,
+            first_name=getattr(chat, "first_name", None),
+            last_name=getattr(chat, "last_name", None),
+            bio=getattr(chat, "bio", None),
+        )
+        return int(chat.id), username, None
+    except Exception as exc:
+        logger.warning("Cannot resolve @%s: %s", username, exc)
+        return None, username, f"@{username} ni topa olmadim (avval u senga yozgan bo'lishi kerak)"
 
 
 async def apply_actions(
@@ -72,9 +105,10 @@ async def apply_actions(
                 fact = str(action.get("fact", "")).strip()
                 if not fact:
                     continue
-                secret = bool(action.get("secret", False))
+                # Relationships / private life default to secret
+                secret = bool(action.get("secret", False)) or _looks_personal(fact)
                 await store.add_memory(fact, is_secret=secret, source="owner_chat")
-                notes.append(("🔒 saved secret: " if secret else "saved: ") + fact[:80])
+                notes.append(("secret saved: " if secret else "saved: ") + fact[:80])
 
             elif kind == "forget":
                 needle = str(action.get("contains", "")).strip().lower()
@@ -90,13 +124,13 @@ async def apply_actions(
                         )
                         removed += 1
                 await store.db.commit()
-                notes.append(f"forgot {removed} fact(s) matching '{needle}'")
+                notes.append(f"forgot {removed} matching '{needle}'")
 
             elif kind == "remind":
                 when = parse_when(str(action.get("when", "")), tz)
                 text = str(action.get("text", "")).strip()
                 if when is None or not text:
-                    notes.append("couldn't schedule reminder (bad time/text)")
+                    notes.append("FAIL: reminder time/text bad")
                     continue
                 job_id = await store.add_job(
                     kind="remind",
@@ -104,19 +138,30 @@ async def apply_actions(
                     text=text,
                     target_chat_id=settings.owner_user_id,
                 )
-                ask_after = action.get("ask_after_hours", settings.reminder_followup_hours)
-                try:
-                    ask_after_h = float(ask_after)
-                except (TypeError, ValueError):
-                    ask_after_h = float(settings.reminder_followup_hours)
-                if ask_after_h > 0:
-                    await store.add_job(
-                        kind="ask",
-                        run_at=(when + timedelta(hours=ask_after_h)).timestamp(),
-                        text=f"Did you actually do this? → {text}",
-                        target_chat_id=settings.owner_user_id,
-                    )
-                notes.append(f"reminder #{job_id} at {when.isoformat(timespec='minutes')}")
+                # Human nag: keep asking until owner confirms done
+                nag_minutes = 30.0
+                if action.get("ask_after_minutes") is not None:
+                    try:
+                        nag_minutes = float(action["ask_after_minutes"])
+                    except (TypeError, ValueError):
+                        nag_minutes = 30.0
+                elif action.get("ask_after_hours") is not None:
+                    try:
+                        nag_minutes = float(action["ask_after_hours"]) * 60
+                    except (TypeError, ValueError):
+                        nag_minutes = 30.0
+                nag_minutes = max(5.0, nag_minutes)
+                await store.add_job(
+                    kind="nag",
+                    run_at=(when + timedelta(minutes=nag_minutes)).timestamp(),
+                    text=text,
+                    repeat_rule=f"nag:{int(nag_minutes)}",
+                    target_chat_id=settings.owner_user_id,
+                )
+                notes.append(
+                    f"reminder #{job_id} at {when.isoformat(timespec='minutes')} "
+                    f"(then I'll keep asking until you say ha/yozdim)"
+                )
 
             elif kind == "send":
                 to_raw = str(action.get("to", "")).strip()
@@ -125,42 +170,58 @@ async def apply_actions(
                 repeat = action.get("repeat")
                 repeat_rule = str(repeat).strip().lower() if repeat else None
                 if not to_raw or not text:
-                    notes.append("couldn't queue send (missing to/text)")
+                    notes.append("FAIL: send missing to/text")
                     continue
 
-                target_chat_id = None
-                target_username = None
-                if re.fullmatch(r"-?\d+", to_raw):
-                    target_chat_id = int(to_raw)
-                else:
-                    target_username = to_raw.lstrip("@")
-                    known = await store.get_contact_by_username(target_username)
-                    if known:
-                        target_chat_id = known["chat_id"]
+                if not connection_id:
+                    active = await store.get_active_connection()
+                    connection_id = active["connection_id"] if active else None
+                if not connection_id:
+                    notes.append("FAIL: no business connection — can't send as you")
+                    continue
+
+                target_chat_id, target_username, err = await resolve_target(
+                    to_raw=to_raw,
+                    store=store,
+                    context=context,
+                )
+                if err and target_chat_id is None:
+                    notes.append(f"FAIL: {err}")
+                    continue
 
                 when = parse_when(when_raw, tz)
                 if when is None:
-                    notes.append("couldn't queue send (bad time)")
+                    notes.append("FAIL: bad send time")
                     continue
 
-                if when_raw.lower() == "now" and connection_id and target_chat_id:
+                send_now = when_raw.lower() == "now" or when <= datetime.now(tz) + timedelta(seconds=15)
+                if send_now:
                     try:
                         await context.bot.send_message(
                             chat_id=target_chat_id,
                             text=text,
                             business_connection_id=connection_id,
                         )
-                        await store.add_message(target_chat_id, "me", text)
-                        notes.append(f"sent now to {to_raw}")
-                        if not repeat_rule:
-                            continue
-                        # schedule next occurrence only
-                        when = _bump_repeat(when, repeat_rule, tz)
-                        if when is None:
-                            continue
-                    except Exception:
+                        await store.add_message(int(target_chat_id), "me", text)
+                        notes.append(f"SENT to {to_raw}: {text[:60]}")
+                        if repeat_rule:
+                            nxt = _bump_repeat(when, repeat_rule, tz)
+                            if nxt:
+                                job_id = await store.add_job(
+                                    kind="send",
+                                    run_at=nxt.timestamp(),
+                                    text=text,
+                                    repeat_rule=repeat_rule,
+                                    target_chat_id=target_chat_id,
+                                    target_username=target_username,
+                                )
+                                notes.append(
+                                    f"queued next #{job_id} at {nxt.isoformat(timespec='minutes')}"
+                                )
+                    except Exception as exc:
                         logger.exception("Immediate send failed to %s", to_raw)
-                        notes.append(f"send failed now to {to_raw}, queued instead")
+                        notes.append(f"FAIL: could not send to {to_raw} ({exc})")
+                    continue
 
                 job_id = await store.add_job(
                     kind="send",
@@ -170,28 +231,58 @@ async def apply_actions(
                     target_chat_id=target_chat_id,
                     target_username=target_username,
                 )
-                notes.append(f"send #{job_id} → {to_raw} at {when.isoformat(timespec='minutes')}")
+                notes.append(
+                    f"QUEUED send #{job_id} → {to_raw} at {when.isoformat(timespec='minutes')} "
+                    f"(not sent yet)"
+                )
+
+            elif kind == "cancel_nags":
+                n = await store.cancel_jobs_by_kinds(("nag", "ask"))
+                notes.append(f"stopped {n} follow-up nags")
 
             else:
                 notes.append(f"unknown action: {kind}")
         except Exception:
             logger.exception("Failed action %s", action)
-            notes.append(f"action failed: {kind}")
+            notes.append(f"FAIL: action {kind}")
 
     return notes
+
+
+async def maybe_clear_nags_on_done(store: Store, text: str) -> int:
+    if not DONE_RE.search(text or ""):
+        return 0
+    return await store.cancel_jobs_by_kinds(("nag", "ask"))
+
+
+def _looks_personal(fact: str) -> bool:
+    f = fact.lower()
+    keys = (
+        "mom", "dad", "ona", "ota", "oyim", "otam", "wife", "girlfriend", "boyfriend",
+        "aunt", "xola", "amma", "relationship", "money", "pul", "secret", "family",
+        "oshna", "sevgili", "nikoh", "divorce", "scam",
+    )
+    return any(k in f for k in keys)
 
 
 def _bump_repeat(from_dt: datetime, repeat_rule: str, tz: ZoneInfo) -> datetime | None:
     rule = repeat_rule.strip().lower()
     if rule == "daily":
         return from_dt + timedelta(days=1)
+    if rule.startswith("nag:"):
+        try:
+            minutes = int(rule.split(":", 1)[1])
+        except ValueError:
+            minutes = 30
+        return from_dt + timedelta(minutes=max(5, minutes))
     if rule.startswith("weekly:"):
         day = rule.split(":", 1)[1]
         if day not in WEEKDAYS:
             return None
-        # keep same clock time, jump to next matching weekday
         candidate = from_dt + timedelta(days=1)
-        candidate = candidate.replace(hour=from_dt.hour, minute=from_dt.minute, second=0, microsecond=0)
+        candidate = candidate.replace(
+            hour=from_dt.hour, minute=from_dt.minute, second=0, microsecond=0
+        )
         while candidate.weekday() != WEEKDAYS[day]:
             candidate += timedelta(days=1)
         return candidate

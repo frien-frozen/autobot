@@ -5,7 +5,7 @@ import logging
 from telegram import Chat, Message, Update
 from telegram.ext import ContextTypes
 
-from chatauto.assistant import apply_actions
+from chatauto.assistant import apply_actions, maybe_clear_nags_on_done
 from chatauto.config import Settings
 from chatauto.gemini import GeminiReplier, has_assist_intent
 from chatauto.store import Store
@@ -83,7 +83,6 @@ async def _split_send(
     chunk = text.strip()
     if not chunk:
         return
-    # Telegram hard limit 4096; keep margin
     limit = 3500
     parts = [chunk[i : i + limit] for i in range(0, len(chunk), limit)] or [chunk]
     for part in parts:
@@ -93,12 +92,17 @@ async def _split_send(
         await context.bot.send_message(**kwargs)
 
 
+async def _owner_memories(store: Store) -> list[dict]:
+    memories = await store.list_memories(include_secrets=True)
+    # inbox events already in memories if source inbox:* — ensure recent ones included
+    return memories
+
+
 async def _handle_owner_chat(
     *,
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
     reply_via_business: bool,
-    force_assist: bool = False,
 ) -> None:
     settings: Settings = context.application.bot_data["settings"]
     store: Store = context.application.bot_data["store"]
@@ -109,8 +113,12 @@ async def _handle_owner_chat(
     connection_id = message.business_connection_id if reply_via_business else None
 
     await store.add_message(chat_id, "them", text)
+    cleared = await maybe_clear_nags_on_done(store, text)
+    if cleared:
+        logger.info("Cleared %s nag/ask jobs after owner confirmation", cleared)
+
     history = await store.recent_messages(chat_id, settings.history_limit)
-    memories = await store.list_memories(include_secrets=True)
+    memories = await _owner_memories(store)
 
     try:
         if reply_via_business and connection_id:
@@ -120,15 +128,14 @@ async def _handle_owner_chat(
                 business_connection_id=connection_id,
             )
 
-        # Casual chat with yourself = just be human. Actions only when clearly asked.
-        if not force_assist and not has_assist_intent(text):
+        if not has_assist_intent(text):
             reply = await gemini.reply_casual_self(
                 incoming=text,
                 history=history,
                 memories=memories,
             )
         else:
-            pending = await store.pending_jobs(15)
+            pending = await store.pending_jobs(20)
             result = await gemini.assist_owner(
                 incoming=text,
                 history=history,
@@ -143,15 +150,11 @@ async def _handle_owner_chat(
                 connection_id=connection_id
                 or ((await store.get_active_connection()) or {}).get("connection_id"),
             )
-            reply = (result.get("reply") or "ha").strip()
-            # Only surface schedule confirms — never dump memory notes into the chat
-            useful = [
-                n
-                for n in notes
-                if n.startswith(("reminder", "send", "sent "))
-            ]
-            if useful:
-                reply = reply + "\n\n" + "\n".join(f"• {n}" for n in useful)
+            draft = (result.get("reply") or "ha").strip()
+            if notes:
+                reply = await gemini.rewrite_with_action_truth(draft_reply=draft, notes=notes)
+            else:
+                reply = draft
 
         await _split_send(
             context=context,
@@ -190,14 +193,12 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     sender = message.from_user
     sender_id = sender.id if sender else None
 
-    # You messaging a stranger from the Business account → pause auto-replies.
     if settings.is_owner(sender_id) and not settings.is_owner(chat_id):
         await store.add_message(chat_id, "me", message.text)
         await store.pause_chat(chat_id, settings.owner_pause_minutes)
         logger.info("Owner manual message in chat %s — paused %sm", chat_id, settings.owner_pause_minutes)
         return
 
-    # Talking to yourself across your accounts.
     if settings.is_owner(sender_id) and settings.is_owner(chat_id):
         await _handle_owner_chat(
             message=message,
@@ -239,6 +240,23 @@ async def on_business_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             business_connection_id=connection_id,
         )
         await store.add_message(chat_id, "me", reply)
+
+        # Owner-only inbox memory — never used in public replies
+        try:
+            note = await gemini.extract_inbox_event(
+                contact=contact,
+                incoming=message.text,
+                reply=reply,
+            )
+            if note:
+                await store.add_memory(
+                    note,
+                    is_secret=True,
+                    source=f"inbox:{chat_id}",
+                )
+                logger.info("Saved inbox event for owner: %s", note[:120])
+        except Exception:
+            logger.exception("Inbox extract failed for chat %s", chat_id)
     except Exception:
         logger.exception("Failed to auto-reply in chat %s", chat_id)
 
@@ -257,7 +275,8 @@ async def on_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await message.reply_text(
             "ishlayapti.\n\n"
             "oddiy yozish — oddiy javob.\n"
-            "eslatma / text @user / remember / don't tell — shunda action qiladi.\n"
+            "@user ga yoz / eslat / remember — action.\n"
+            "ha/yozdim — nag to'xtaydi.\n"
         )
         return
 

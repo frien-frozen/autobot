@@ -361,3 +361,31 @@ class Store:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    async def cancel_jobs_by_kinds(self, kinds: tuple[str, ...]) -> int:
+        if not kinds:
+            return 0
+        placeholders = ",".join("?" for _ in kinds)
+        cursor = await self.db.execute(
+            f"""
+            UPDATE jobs
+            SET status = 'cancelled'
+            WHERE status = 'pending' AND kind IN ({placeholders})
+            """,
+            kinds,
+        )
+        await self.db.commit()
+        return int(cursor.rowcount or 0)
+
+    async def recent_owner_events(self, limit: int = 30) -> list[dict]:
+        cursor = await self.db.execute(
+            """
+            SELECT * FROM memories
+            WHERE active = 1 AND source LIKE 'inbox:%'
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
